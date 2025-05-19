@@ -1,14 +1,14 @@
 import datetime
 import uuid
-from abc import ABC
 
 from dspy.dsp.utils import settings
 from dspy.utils.callback import with_callbacks
 
+MAX_HISTORY_SIZE = 10_000
 GLOBAL_HISTORY = []
 
 
-class BaseLM(ABC):
+class BaseLM:
     """Base class for handling LLM calls.
 
     Most users can directly use the `dspy.LM` class, which is a subclass of `BaseLM`. Users can also implement their
@@ -47,11 +47,9 @@ class BaseLM(ABC):
         self.kwargs = dict(temperature=temperature, max_tokens=max_tokens, **kwargs)
         self.history = []
 
-    @with_callbacks
-    def __call__(self, prompt=None, messages=None, **kwargs):
-        response = self.forward(prompt=prompt, messages=messages, **kwargs)
-
-        if kwargs.get("logprobs"):
+    def _process_lm_response(self, response, prompt, messages, **kwargs):
+        merged_kwargs = {**self.kwargs, **kwargs}
+        if merged_kwargs.get("logprobs"):
             outputs = [
                 {
                     "text": c.message.content if hasattr(c, "message") else c["text"],
@@ -83,13 +81,33 @@ class BaseLM(ABC):
         }
         self.history.append(entry)
         self.update_global_history(entry)
+        return outputs
 
+    @with_callbacks
+    def __call__(self, prompt=None, messages=None, **kwargs):
+        response = self.forward(prompt=prompt, messages=messages, **kwargs)
+        outputs = self._process_lm_response(response, prompt, messages, **kwargs)
+
+        return outputs
+
+    @with_callbacks
+    async def acall(self, prompt=None, messages=None, **kwargs):
+        response = await self.aforward(prompt=prompt, messages=messages, **kwargs)
+        outputs = self._process_lm_response(response, prompt, messages, **kwargs)
         return outputs
 
     def forward(self, prompt=None, messages=None, **kwargs):
         """Forward pass for the language model.
 
         Subclasses must implement this method, and the response should be identical to
+        [OpenAI response format](https://platform.openai.com/docs/api-reference/responses/object).
+        """
+        raise NotImplementedError("Subclasses must implement this method.")
+
+    async def aforward(self, prompt=None, messages=None, **kwargs):
+        """Async forward pass for the language model.
+
+        Subclasses that support async should implement this method, and the response should be identical to
         [OpenAI response format](https://platform.openai.com/docs/api-reference/responses/object).
         """
         raise NotImplementedError("Subclasses must implement this method.")
@@ -116,6 +134,9 @@ class BaseLM(ABC):
     def update_global_history(self, entry):
         if settings.disable_history:
             return
+
+        if len(GLOBAL_HISTORY) >= MAX_HISTORY_SIZE:
+            GLOBAL_HISTORY.pop(0)
 
         GLOBAL_HISTORY.append(entry)
 
@@ -156,17 +177,25 @@ def _inspect_history(history, n: int = 1):
                             image_str = ""
                             if "base64" in c["image_url"].get("url", ""):
                                 len_base64 = len(c["image_url"]["url"].split("base64,")[1])
-                                image_str = f"<{c['image_url']['url'].split('base64,')[0]}base64,<IMAGE BASE 64 ENCODED({str(len_base64)})>"
+                                image_str = (
+                                    f"<{c['image_url']['url'].split('base64,')[0]}base64,"
+                                    f"<IMAGE BASE 64 ENCODED({len_base64!s})>"
+                                )
                             else:
                                 image_str = f"<image_url: {c['image_url']['url']}>"
                             print(_blue(image_str.strip()))
+                        elif c["type"] == "input_audio":
+                            audio_format = c["input_audio"]["format"]
+                            len_audio = len(c["input_audio"]["data"])
+                            audio_str = f"<audio format='{audio_format}' base64-encoded, length={len_audio}>"
+                            print(_blue(audio_str.strip()))
             print("\n")
 
         print(_red("Response:"))
         print(_green(outputs[0].strip()))
 
         if len(outputs) > 1:
-            choices_text = f" \t (and {len(outputs)-1} other completions)"
+            choices_text = f" \t (and {len(outputs) - 1} other completions)"
             print(_red(choices_text, end=""))
 
     print("\n\n\n")

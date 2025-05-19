@@ -1,16 +1,18 @@
+import logging
 import random
 
 from pydantic import BaseModel
 
+from dspy.adapters.chat_adapter import ChatAdapter
 from dspy.clients.base_lm import BaseLM
 from dspy.clients.lm import LM
+from dspy.dsp.utils.settings import settings
 from dspy.predict.parameter import Parameter
 from dspy.primitives.prediction import Prediction
 from dspy.primitives.program import Module
 from dspy.signatures.signature import ensure_signature
-from dspy.utils.callback import with_callbacks
-from dspy.dsp.utils import settings
-from dspy.adapters.chat_adapter import ChatAdapter
+
+logger = logging.getLogger(__name__)
 
 
 class Predict(Module, Parameter):
@@ -68,11 +70,27 @@ class Predict(Module, Parameter):
 
         return self
 
-    @with_callbacks
-    def __call__(self, **kwargs):
-        return self.forward(**kwargs)
+    def _get_positional_args_error_message(self):
+        input_fields = list(self.signature.input_fields.keys())
+        return (
+            "Positional arguments are not allowed when calling `dspy.Predict`, must use keyword arguments "
+            f"that match your signature input fields: '{', '.join(input_fields)}'. For example: "
+            f"`predict({input_fields[0]}=input_value, ...)`."
+        )
 
-    def forward(self, **kwargs):
+    def __call__(self, *args, **kwargs):
+        if args:
+            raise ValueError(self._get_positional_args_error_message())
+
+        return super().__call__(**kwargs)
+
+    async def acall(self, *args, **kwargs):
+        if args:
+            raise ValueError(self._get_positional_args_error_message())
+
+        return await super().acall(**kwargs)
+
+    def _forward_preprocess(self, **kwargs):
         # Extract the three privileged keyword arguments.
         assert "new_signature" not in kwargs, "new_signature is no longer a valid keyword argument."
         signature = ensure_signature(kwargs.pop("signature", self.signature))
@@ -83,9 +101,8 @@ class Predict(Module, Parameter):
         lm = kwargs.pop("lm", self.lm) or settings.lm
         assert isinstance(lm, BaseLM), "No LM is loaded."
 
-        # If temperature is 0.0 but its n > 1, set temperature to 0.7.
-        temperature = config.get("temperature")
-        temperature = lm.kwargs["temperature"] if temperature is None else temperature
+        # If temperature is unset or <=0.15, and n > 1, set temperature to 0.7 to keep randomness.
+        temperature = config.get("temperature") or lm.kwargs.get("temperature")
         num_generations = config.get("n") or lm.kwargs.get("n") or lm.kwargs.get("num_generations") or 1
 
         if (temperature is None or temperature <= 0.15) and num_generations > 1:
@@ -94,24 +111,54 @@ class Predict(Module, Parameter):
         if not all(k in kwargs for k in signature.input_fields):
             present = [k for k in signature.input_fields if k in kwargs]
             missing = [k for k in signature.input_fields if k not in kwargs]
-            print(f"WARNING: Not all input fields were provided to module. Present: {present}. Missing: {missing}.")
+            logger.warning(
+                "Not all input fields were provided to module. Present: %s. Missing: %s.",
+                present,
+                missing,
+            )
+        return lm, config, signature, demos, kwargs
 
-        adapter = settings.adapter or ChatAdapter()
-        completions = adapter(
-            lm,
-            lm_kwargs=config,
-            signature=signature,
-            demos=demos,
-            inputs=kwargs,
-        )
-
+    def _forward_postprocess(self, completions, signature, **kwargs):
         pred = Prediction.from_completions(completions, signature=signature)
-
         if kwargs.pop("_trace", True) and settings.trace is not None:
             trace = settings.trace
             trace.append((self, {**kwargs}, pred))
-
         return pred
+
+    def _should_stream(self):
+        stream_listeners = settings.stream_listeners or []
+        should_stream = settings.send_stream is not None
+        if should_stream and len(stream_listeners) > 0:
+            should_stream = any(stream_listener.predict == self for stream_listener in stream_listeners)
+
+        return should_stream
+
+    def forward(self, **kwargs):
+        lm, config, signature, demos, kwargs = self._forward_preprocess(**kwargs)
+
+        adapter = settings.adapter or ChatAdapter()
+
+        if self._should_stream():
+            with settings.context(caller_predict=self):
+                completions = adapter(lm, lm_kwargs=config, signature=signature, demos=demos, inputs=kwargs)
+        else:
+            with settings.context(send_stream=None):
+                completions = adapter(lm, lm_kwargs=config, signature=signature, demos=demos, inputs=kwargs)
+
+        return self._forward_postprocess(completions, signature, **kwargs)
+
+    async def aforward(self, **kwargs):
+        lm, config, signature, demos, kwargs = self._forward_preprocess(**kwargs)
+
+        adapter = settings.adapter or ChatAdapter()
+        if self._should_stream():
+            with settings.context(caller_predict=self):
+                completions = await adapter.acall(lm, lm_kwargs=config, signature=signature, demos=demos, inputs=kwargs)
+        else:
+            with settings.context(send_stream=None):
+                completions = await adapter.acall(lm, lm_kwargs=config, signature=signature, demos=demos, inputs=kwargs)
+
+        return self._forward_postprocess(completions, signature, **kwargs)
 
     def update_config(self, **kwargs):
         self.config = {**self.config, **kwargs}
